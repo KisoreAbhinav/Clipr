@@ -16,7 +16,7 @@ except Exception:
     PdfWriter = None
 
 from clipr_context import OperationRecord, PendingAction, SessionContext
-from clipr_paths import resolve_path_hint, task_target_directory
+from clipr_paths import resolve_location, resolve_path_hint, task_target_directory
 
 
 class CliprExecutor:
@@ -135,25 +135,29 @@ class CliprExecutor:
         context_refs = entities.get("context_refs", {})
 
         if not target:
-            resolved_targets = self._resolve_targets(task, include_selection=True)
-            if resolved_targets:
-                target = resolved_targets[0]
-            elif context_refs.get("uses_previous_context"):
-                target = self.context.last_referenced_path or self.context.last_opened_directory or self.context.current_directory
+            if entities.get("locations"):
+                target = resolve_location(entities["locations"][0], self.context)
             else:
-                # If user explicitly asked to open something by name but no target resolved, fail fast.
-                explicit_open_target = re.search(r"^open\s+(.+)$", raw_clause)
-                if explicit_open_target and explicit_open_target.group(1).strip() not in {
-                    "here", "thisfolder", "thisdirectory", "currentfolder", "currentdirectory"
-                }:
-                    return f"Could not resolve open target: {explicit_open_target.group(1).strip()}"
-                target = self.context.current_directory
+                resolved_targets = self._resolve_targets(task, include_selection=True)
+                if resolved_targets:
+                    target = resolved_targets[0]
+                elif context_refs.get("uses_previous_context"):
+                    target = self.context.last_referenced_path or self.context.last_opened_directory or self.context.current_directory
+                else:
+                    # If user explicitly asked to open something by name but no target resolved, fail fast.
+                    explicit_open_target = re.search(r"^open\s+(.+)$", raw_clause)
+                    if explicit_open_target and explicit_open_target.group(1).strip() not in {
+                        "here", "thisfolder", "thisdirectory", "currentfolder", "currentdirectory"
+                    }:
+                        return f"Could not resolve open target: {explicit_open_target.group(1).strip()}"
+                    target = self.context.current_directory
 
         if target.is_dir():
-            self.context.current_directory = target
-            self.context.last_opened_directory = target
-            self._remember_reference_paths([target], mark_primary=True)
-            return f"Opened directory: {target}"
+            resolved_target = target.resolve()
+            self.context.current_directory = resolved_target
+            self.context.last_opened_directory = resolved_target
+            self._remember_reference_paths([resolved_target], mark_primary=True)
+            return f"Opened directory: {resolved_target}"
 
         if not target.exists():
             return f"Path not found: {target}"
@@ -971,13 +975,52 @@ class CliprExecutor:
     def _handle_rename(self, task: Dict[str, Any]) -> str:
         entities = task.get("entities", {})
         rule = entities.get("rename_rule") or {}
+
+        if rule.get("mode") == "direct_rename":
+            return self._execute_direct_rename(task, rule, entities.get("conflict_policy", "ask"))
+
         targets = self._resolve_targets(task, include_selection=True)
         if not targets:
-            targets = [p for p in self.context.current_directory.iterdir() if p.is_file()]
-            if not targets:
-                return "No files available for rename."
+            return "Could not resolve what to rename. Mention the exact file/folder name or select items first."
 
         return self._execute_rename(targets, rule, entities.get("conflict_policy", "ask"))
+
+    def _execute_direct_rename(self, task: Dict[str, Any], rule: Dict[str, Any], conflict_policy: str) -> str:
+        source_name = (rule.get("source_name") or "").strip()
+        new_name = (rule.get("new_name") or "").strip()
+        if not source_name or not new_name:
+            return "Rename command is incomplete. Use: rename <old_name> to <new_name>."
+
+        source_candidate = Path(source_name)
+        source_path = source_candidate if source_candidate.is_absolute() else self.context.current_directory / source_candidate
+
+        if not source_path.exists():
+            fuzzy = self._fuzzy_match_in_context(source_name, task)
+            if fuzzy:
+                source_path = fuzzy
+
+        if not source_path.exists():
+            return f"Could not find item to rename: {source_name}"
+
+        requested_target = source_path.with_name(new_name)
+        if source_path.is_file() and not Path(new_name).suffix and source_path.suffix:
+            requested_target = source_path.with_name(f"{new_name}{source_path.suffix}")
+
+        if requested_target.exists() and conflict_policy == "ask":
+            return "Rename target already exists. Say overwrite, keep both, or skip."
+
+        resolved_target = self._resolve_conflict_target(requested_target, conflict_policy)
+        if resolved_target is None:
+            return "Rename skipped because target already exists."
+
+        source_path.rename(resolved_target)
+
+        self._push_history(
+            undo_op={"op": "rename_back", "pairs": [(str(source_path), str(resolved_target))]},
+            redo_op={"op": "rename_forward", "pairs": [(str(source_path), str(resolved_target))]},
+            label="rename",
+        )
+        return f"Renamed 1 item: {source_path.name} -> {resolved_target.name}"
 
     def _execute_rename(self, targets: List[Any], rule: Dict[str, Any], conflict_policy: str) -> str:
         paths = [Path(t) for t in targets]
@@ -1415,7 +1458,7 @@ class CliprExecutor:
 
     def _fuzzy_match_in_context(self, query: str, task: Dict[str, Any]) -> Optional[Path]:
         normalized_query = self._normalize_for_match(query)
-        if len(normalized_query) < 3:
+        if len(normalized_query) < 2:
             return None
 
         entities = task.get("entities", {})
@@ -1443,18 +1486,43 @@ class CliprExecutor:
         if not candidates:
             return None
 
+        query_tokens = [tok for tok in re.findall(r"[a-z0-9]+", query.lower()) if tok]
         best: Optional[Path] = None
         best_score = 0.0
+
         for candidate in candidates:
-            score = SequenceMatcher(
-                None,
-                normalized_query,
-                self._normalize_for_match(candidate.stem),
-            ).ratio()
+            candidate_norm = self._normalize_for_match(candidate.stem)
+            candidate_tokens = [tok for tok in re.findall(r"[a-z0-9]+", candidate.stem.lower()) if tok]
+
+            if normalized_query == candidate_norm:
+                score = 1.0
+            elif normalized_query in candidate_norm:
+                # Strong signal for natural queries like "open keil" -> "keil uvision5".
+                score = 0.95
+            elif query_tokens and all(
+                any(token.startswith(qt) or qt in token for token in candidate_tokens)
+                for qt in query_tokens
+            ):
+                score = 0.9
+            elif query_tokens and any(
+                any(token.startswith(qt) for token in candidate_tokens)
+                for qt in query_tokens
+            ):
+                score = 0.82
+            else:
+                score = SequenceMatcher(None, normalized_query, candidate_norm).ratio()
+
             if score > best_score:
                 best_score = score
                 best = candidate
 
-        if best and best_score >= 0.72:
+        intent = task.get("intent")
+        threshold = 0.6 if intent == "open" else 0.72
+        if best and best_score >= threshold:
             return best
         return None
+
+
+
+
+

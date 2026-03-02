@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -14,21 +15,78 @@ KNOWN_LOCATIONS: Dict[str, str] = {
 }
 
 
+def _canonicalize_location(value: str) -> str:
+    normalized = value.strip(" '\"").lower()
+    normalized = normalized.replace("_", " ")
+    normalized = " ".join(normalized.split())
+
+    alias_map = {
+        "thisfolder": "current",
+        "thisdirectory": "current",
+        "currentfolder": "current",
+        "currentdirectory": "current",
+        "here": "current",
+        "desktop": "desktop",
+        "desktop folder": "desktop",
+        "download": "downloads",
+        "downloads": "downloads",
+        "downloads folder": "downloads",
+        "document": "documents",
+        "documents": "documents",
+        "documents folder": "documents",
+        "picture": "pictures",
+        "pictures": "pictures",
+        "photo": "pictures",
+        "photos": "pictures",
+        "music": "music",
+        "videos": "videos",
+        "video": "videos",
+    }
+
+    return alias_map.get(normalized, normalized)
+
+
+def _desktop_path(home: Path) -> Path:
+    candidates: List[Path] = []
+
+    onedrive = os.environ.get("OneDrive") or os.environ.get("ONEDRIVE")
+    if onedrive:
+        candidates.append(Path(onedrive) / "Desktop")
+
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        candidates.append(Path(userprofile) / "OneDrive" / "Desktop")
+
+    candidates.append(home / "Desktop")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return candidates[0]
+
+
 def resolve_location(location: str, context: SessionContext) -> Path:
-    if location == "current":
+    location_key = _canonicalize_location(location)
+    if location_key == "current":
         return context.current_directory
+
     home = Path.home()
-    return home / KNOWN_LOCATIONS.get(location, location)
+    if location_key == "desktop":
+        return _desktop_path(home)
+
+    return home / KNOWN_LOCATIONS.get(location_key, location_key)
 
 
 def resolve_path_hint(path_hint: Optional[str], context: SessionContext) -> Optional[Path]:
     if not path_hint:
         return None
-    lower = path_hint.lower()
-    if lower in {"current", "thisfolder", "thisdirectory", "currentfolder", "currentdirectory"}:
+
+    canonical = _canonicalize_location(path_hint)
+    if canonical == "current":
         return context.current_directory
-    if lower in KNOWN_LOCATIONS:
-        return resolve_location(lower, context)
+    if canonical in KNOWN_LOCATIONS:
+        return resolve_location(canonical, context)
 
     candidate = Path(path_hint)
     if candidate.is_absolute():
@@ -47,3 +105,5 @@ def task_target_directory(task: Dict, context: SessionContext) -> Path:
         return resolve_location(locations[0], context)
 
     return context.current_directory
+
+

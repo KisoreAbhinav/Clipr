@@ -4,19 +4,19 @@ from typing import Any, Dict, List, Optional, Set
 
 # Core intents for file-manager style commands.
 INTENT_KEYWORDS: Dict[str, Set[str]] = {
-    "create": {"create", "make", "new", "generate", "build", "add"},
-    "delete": {"delete", "remove", "erase", "discard"},
-    "copy": {"copy", "duplicate", "clone"},
+    "create": {"create", "make", "new", "generate", "build", "add", "produce"},
+    "delete": {"delete", "remove", "erase", "discard", "trash", "bin"},
+    "copy": {"copy", "duplicate", "clone", "replicate"},
     "cut": {"cut"},
     "paste": {"paste"},
-    "move": {"move", "store", "put", "place", "transfer", "relocate"},
+    "move": {"move", "store", "put", "place", "transfer", "relocate", "shift", "send", "drop"},
     "rename": {"rename", "retitle"},
     "undo": {"undo", "revert"},
     "redo": {"redo", "repeat"},
     "select": {"select", "selection", "highlight", "choose", "mark", "unselect", "deselect", "clear"},
-    "locate": {"locate", "find", "search", "lookup"},
-    "open": {"open", "launch", "start", "browse"},
-    "list": {"list", "show", "display", "view"},
+    "locate": {"locate", "find", "search", "lookup", "where"},
+    "open": {"open", "launch", "start", "browse", "go", "enter", "navigate", "visit", "head"},
+    "list": {"list", "show", "display", "view", "see", "contents"},
     "sort": {"sort", "arrange", "order", "organize", "group"},
     "zip": {"zip", "compress", "archive", "pack"},
     "extract": {"extract", "unzip", "decompress", "unpack"},
@@ -90,7 +90,7 @@ SORT_KEYWORDS: Set[str] = {"name", "date", "size", "type", "created", "modified"
 STOPWORDS = {
     "a", "an", "the", "to", "of", "on", "in", "into", "inside", "it", "that", "this",
     "with", "for", "by", "called", "named", "new", "and", "then", "please", "kindly",
-    "now", "out",
+    "now", "out", "me", "my", "our", "us", "can", "could", "would", "you", "just",
 }
 
 SEQUENCE_SPLIT_PATTERN = (
@@ -98,7 +98,8 @@ SEQUENCE_SPLIT_PATTERN = (
 )
 AND_ACTION_SPLIT_PATTERN = (
     r"\band (?=(?:create|make|new|generate|build|add|delete|remove|erase|copy|cut|paste|move|store|put|place|transfer|"
-    r"rename|undo|redo|select|find|search|open|show|display|list|sort|organize|zip|extract|merge|split|rotate)\b)"
+    r"rename|undo|redo|select|find|search|open|show|display|list|sort|organize|zip|extract|merge|split|rotate|"
+    r"go|navigate|launch|browse|enter|visit|head)\b)"
 )
 
 WINDOWS_PATH_PATTERN = r"[a-zA-Z]:\\[^\s<>:\"|?*\n\r]*"
@@ -119,6 +120,24 @@ def normalize_text(text: str) -> str:
         "compress pdf": "compresspdf",
         "optimize pdf": "optimizepdf",
         "reduce pdf size": "compresspdf",
+        "take me to ": "open ",
+        "bring me to ": "open ",
+        "navigate to ": "open ",
+        "head to ": "open ",
+        "go to ": "open ",
+        "what's in ": "list ",
+        "what's on ": "list ",
+        "what is in ": "list ",
+        "what is on ": "list ",
+        "what files are in ": "list files in ",
+        "what files are on ": "list files in ",
+        "what folders are in ": "list folders in ",
+        "what folders are on ": "list folders in ",
+        "what items are in ": "list items in ",
+        "what items are on ": "list items in ",
+        "show me the contents of ": "list ",
+        "show me contents of ": "list ",
+        "show me files in ": "list files in ",
     }
     for src, dst in replacements.items():
         cleaned = cleaned.replace(src, dst)
@@ -145,8 +164,21 @@ def get_main_tokens(tokens: List[str]) -> List[str]:
     return [tok for tok in tokens if tok not in STOPWORDS]
 
 
-def detect_intent(main_tokens: List[str]) -> str:
+def detect_intent(clause: str, main_tokens: List[str]) -> str:
     token_set = set(main_tokens)
+
+    # Phrase-first routing for conversational commands.
+    if re.search(r"\b(?:go|navigate|enter|visit|head|open)\b(?:\s+to|\s+into)?\s+(?:thisfolder|currentfolder|thisdirectory|currentdirectory|desktop|downloads?|documents?|pictures?|photos?|music|videos?|home|parent)\b", clause):
+        return "open"
+    if re.search(r"\b(?:go up|up one level|parent folder|parent directory)\b", clause):
+        return "open"
+    if re.search(r"\b(?:what(?:'s| is)\s+(?:in|on)|what\s+(?:files|folders|items)\s+are\s+(?:in|on)|show me (?:what(?:'s| is)\s+(?:in|on)|contents|the contents)|list out|show files|show folders)\b", clause):
+        return "list"
+    if re.search(r"\b(?:where is|where are)\b", clause):
+        return "locate"
+    if re.search(r"\b(?:change name of|change the name of|rename)\b.*\bto\b", clause):
+        return "rename"
+
     # Selection commands may contain words like "remove" that overlap delete.
     if "selection" in token_set and token_set.intersection({"select", "clear", "remove", "add", "deselect", "unselect"}):
         return "select"
@@ -157,6 +189,19 @@ def detect_intent(main_tokens: List[str]) -> str:
             matched.append(intent)
     if not matched:
         return "unknown"
+
+    priority = [
+        "confirm", "cancel",
+        "undo", "redo",
+        "properties", "pdf_tool", "extract", "zip",
+        "sort", "rename",
+        "paste", "cut", "copy", "move",
+        "delete", "create", "locate", "open", "list", "select",
+    ]
+    for intent in priority:
+        if intent in matched:
+            return intent
+    return "unknown"
 
     priority = [
         "confirm", "cancel",
@@ -251,23 +296,34 @@ def extract_paths(clause: str) -> List[str]:
 
 
 def normalize_location_or_path(segment: str) -> str:
-    value = segment.strip(" '\"")
+    value = segment.strip(" '\"").lower()
+    value = re.sub(r"^(?:in|on|to|into|inside|from)\s+", "", value)
+    value = re.sub(r"^(?:the|my)\s+", "", value)
+    value = re.sub(r"\s+(?:folder|directory)$", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+
     location_map = {
         "thisfolder": "current",
         "thisdirectory": "current",
         "currentfolder": "current",
         "currentdirectory": "current",
+        "here": "current",
         "desktop": "desktop",
+        "download": "downloads",
         "downloads": "downloads",
+        "document": "documents",
         "documents": "documents",
+        "picture": "pictures",
         "pictures": "pictures",
+        "photo": "pictures",
+        "photos": "pictures",
         "music": "music",
+        "video": "videos",
         "videos": "videos",
     }
     if value in location_map:
         return location_map[value]
     return value
-
 
 def extract_source_destination(clause: str, paths: List[str]) -> Dict[str, Optional[str]]:
     source: Optional[str] = None
@@ -309,18 +365,18 @@ def extract_source_destination(clause: str, paths: List[str]) -> Dict[str, Optio
 
 def extract_locations(clause: str) -> List[str]:
     location_patterns = {
-        "desktop": r"\b(?:in|on|to|into|inside|from)\s+desktop\b",
-        "downloads": r"\b(?:in|on|to|into|inside|from)\s+downloads?\b",
-        "documents": r"\b(?:in|on|to|into|inside|from)\s+documents?\b",
-        "pictures": r"\b(?:in|on|to|into|inside|from)\s+(?:pictures?|photos?)\b",
-        "music": r"\b(?:in|on|to|into|inside|from)\s+music\b",
-        "videos": r"\b(?:in|on|to|into|inside|from)\s+videos?\b",
+        "desktop": r"\b(?:in|on|to|into|inside|from)?\s*desktop\b",
+        "downloads": r"\b(?:in|on|to|into|inside|from)?\s*downloads?\b",
+        "documents": r"\b(?:in|on|to|into|inside|from)?\s*documents?\b",
+        "pictures": r"\b(?:in|on|to|into|inside|from)?\s*(?:pictures?|photos?)\b",
+        "music": r"\b(?:in|on|to|into|inside|from)?\s*music\b",
+        "videos": r"\b(?:in|on|to|into|inside|from)?\s*videos?\b",
     }
     found: List[str] = []
     for name, pattern in location_patterns.items():
         if re.search(pattern, clause):
             found.append(name)
-    if any(key in clause for key in {"thisfolder", "currentfolder", "thisdirectory", "currentdirectory", "here"}):
+    if re.search(r"\b(?:thisfolder|currentfolder|thisdirectory|currentdirectory|here)\b", clause):
         found.append("current")
     deduped: List[str] = []
     for loc in found:
@@ -329,6 +385,12 @@ def extract_locations(clause: str) -> List[str]:
     return deduped
 
 
+def extract_navigation_target(clause: str, intent: str) -> Optional[str]:
+    if intent != "open":
+        return None
+    if re.search(r"\b(?:go up|up one level|parent folder|parent directory)\b", clause):
+        return ".."
+    return None
 def extract_sort_by(main_tokens: List[str]) -> List[str]:
     found = [t for t in main_tokens if t in SORT_KEYWORDS]
     deduped: List[str] = []
@@ -439,6 +501,8 @@ def extract_rename_rule(clause: str) -> Dict[str, Optional[str]]:
         "prefix": None,
         "suffix": None,
         "start_index": None,
+        "source_name": None,
+        "new_name": None,
     }
 
     replace_match = re.search(r"\breplace\s+(.+?)\s+with\s+(.+)$", clause)
@@ -459,6 +523,28 @@ def extract_rename_rule(clause: str) -> Dict[str, Optional[str]]:
         rule["mode"] = "add_suffix"
         rule["suffix"] = suffix_match.group(1).strip(" '\"")
         return rule
+
+    direct_patterns = [
+        r"\brename\s+(.+?)\s+to\s+(.+)$",
+        r"\bchange name of\s+(.+?)\s+to\s+(.+)$",
+        r"\bchange the name of\s+(.+?)\s+to\s+(.+)$",
+    ]
+    for pattern in direct_patterns:
+        direct_match = re.search(pattern, clause)
+        if not direct_match:
+            continue
+
+        source_name = direct_match.group(1).strip(" '\"")
+        new_name = direct_match.group(2).strip(" '\"")
+
+        source_name = re.sub(r"^(?:file|folder|item)\s+", "", source_name)
+        source_name = re.sub(r"^(?:called|named)\s+", "", source_name)
+
+        if source_name not in {"all", "all files", "all folders", "these", "selected", "selected files", "selected folders"}:
+            rule["mode"] = "direct_rename"
+            rule["source_name"] = source_name
+            rule["new_name"] = new_name
+            return rule
 
     to_match = re.search(r"\brename(?: all| these| selected)?(?: files| folders)?(?: to)?\s+(.+)$", clause)
     if to_match:
@@ -541,14 +627,14 @@ def requires_confirmation(intent: str) -> bool:
 def parse_task_clause(clause: str) -> Dict[str, Any]:
     tokens = tokenize(clause)
     main_tokens = get_main_tokens(tokens)
-    intent = detect_intent(main_tokens)
+    intent = detect_intent(clause, main_tokens)
     extensions = extract_extensions(clause, main_tokens)
     paths = extract_paths(clause)
     src_dst = extract_source_destination(clause, paths)
     transfer_intents = {"copy", "cut", "move", "paste"}
     source = src_dst["source"] if intent in transfer_intents else None
     destination = src_dst["destination"] if intent in transfer_intents else None
-    target_path = paths[0] if paths else None
+    target_path = paths[0] if paths else extract_navigation_target(clause, intent)
 
     entities = {
         "objects": extract_objects(main_tokens, extensions),
@@ -597,3 +683,18 @@ def parse_command(command: str) -> Dict[str, Any]:
         "primary_task": primary_task,
         "tasks": tasks,
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
