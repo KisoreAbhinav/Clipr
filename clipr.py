@@ -3,6 +3,7 @@ import queue
 import json
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
+#from Rules import main
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEVICE_INDEX = 2
@@ -15,8 +16,10 @@ recognizer = KaldiRecognizer(model, 16000)
 q = queue.Queue()
 waiting_for_command = False
 
+
 def callback(indata, frames, time, status):
     q.put(bytes(indata))
+
 
 with sd.RawInputStream(
     device = DEVICE_INDEX,
