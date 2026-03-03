@@ -25,10 +25,26 @@ class CliprExecutor:
         self.context.trash_directory.mkdir(parents=True, exist_ok=True)
 
     def execute_parsed_command(self, parsed: Dict[str, Any]) -> str:
-        task = parsed.get("primary_task")
-        if not task:
+        tasks = parsed.get("tasks") or ([] if not parsed.get("primary_task") else [parsed["primary_task"]])
+        if not tasks:
             return "No actionable task found."
 
+        if len(tasks) == 1:
+            return self._execute_single_task(tasks[0])
+
+        results: List[str] = []
+        for idx, task in enumerate(tasks, start=1):
+            result = self._execute_single_task(task)
+            results.append(f"Task {idx}: {result}")
+
+            # If a task requested confirmation, stop here to avoid unsafe chained effects.
+            if self.context.pending_action and idx < len(tasks):
+                results.append("Batch paused: resolve pending confirmation before remaining tasks.")
+                break
+
+        return "\n".join(results)
+
+    def _execute_single_task(self, task: Dict[str, Any]) -> str:
         intent = task.get("intent", "unknown")
         entities = task.get("entities", {})
         confirmation_response = entities.get("confirmation_response")
@@ -130,27 +146,50 @@ class CliprExecutor:
     def _handle_open(self, task: Dict[str, Any]) -> str:
         entities = task.get("entities", {})
         raw_clause = task.get("raw_clause", "").strip()
-        target = resolve_path_hint(entities.get("target_path"), self.context)
+        filters = entities.get("filters", {})
         app = entities.get("open_with_app")
         context_refs = entities.get("context_refs", {})
 
+        target = resolve_path_hint(entities.get("target_path"), self.context)
+        query_open = bool(
+            entities.get("name")
+            or filters.get("contains_text")
+            or filters.get("regex_pattern")
+            or entities.get("extensions")
+        )
+        open_all_requested = bool(filters.get("all_items") or re.search(r"\bopen\s+all\b", raw_clause))
+
         if not target:
             if entities.get("locations"):
-                target = resolve_location(entities["locations"][0], self.context)
+                location_dir = resolve_location(entities["locations"][0], self.context)
+                if open_all_requested and query_open:
+                    matches = self._collect_items(
+                        location_dir,
+                        entities,
+                        recursive=filters.get("recursive", False),
+                    )
+                    if not matches:
+                        return f"No matching items to open in {location_dir}"
+                    return self._open_multiple_targets(matches, app)
+                target = location_dir
             else:
                 resolved_targets = self._resolve_targets(task, include_selection=True)
                 if resolved_targets:
+                    if open_all_requested or (len(resolved_targets) > 1 and query_open):
+                        return self._open_multiple_targets(resolved_targets, app)
                     target = resolved_targets[0]
                 elif context_refs.get("uses_previous_context"):
                     target = self.context.last_referenced_path or self.context.last_opened_directory or self.context.current_directory
                 else:
-                    # If user explicitly asked to open something by name but no target resolved, fail fast.
                     explicit_open_target = re.search(r"^open\s+(.+)$", raw_clause)
                     if explicit_open_target and explicit_open_target.group(1).strip() not in {
                         "here", "thisfolder", "thisdirectory", "currentfolder", "currentdirectory"
                     }:
                         return f"Could not resolve open target: {explicit_open_target.group(1).strip()}"
                     target = self.context.current_directory
+
+        if not target.exists():
+            return f"Path not found: {target}"
 
         if target.is_dir():
             resolved_target = target.resolve()
@@ -159,9 +198,16 @@ class CliprExecutor:
             self._remember_reference_paths([resolved_target], mark_primary=True)
             return f"Opened directory: {resolved_target}"
 
-        if not target.exists():
-            return f"Path not found: {target}"
+        open_error = self._open_single_target(target, app)
+        if open_error:
+            return f"Could not open target: {open_error}"
 
+        self._remember_reference_paths([target], mark_primary=True)
+        if app:
+            return f"Opened '{target.name}' with {app}."
+        return f"Opened: {target}"
+
+    def _open_single_target(self, target: Path, app: Optional[str]) -> Optional[str]:
         if app:
             app_cmd = {
                 "vscode": "code",
@@ -176,22 +222,51 @@ class CliprExecutor:
             }.get(app, app)
             try:
                 subprocess.Popen([app_cmd, str(target)])
-                self._remember_reference_paths([target], mark_primary=True)
-                return f"Opened '{target.name}' with {app}."
-            except Exception as exc:
-                try:
-                    os.startfile(str(target))
-                    self._remember_reference_paths([target], mark_primary=True)
-                    return f"App '{app}' unavailable ({exc}). Opened with default app instead."
-                except Exception as fallback_exc:
-                    return f"Could not open with {app}: {exc}. Fallback failed: {fallback_exc}"
+                return None
+            except Exception:
+                # Fall back to default app if specific app launch fails.
+                pass
 
         try:
             os.startfile(str(target))
-            self._remember_reference_paths([target], mark_primary=True)
-            return f"Opened: {target}"
+            return None
         except Exception as exc:
-            return f"Could not open target: {exc}"
+            return str(exc)
+
+    def _open_multiple_targets(self, targets: List[Path], app: Optional[str]) -> str:
+        existing_targets = [p for p in targets if p and p.exists()]
+        deduped_targets = self._dedupe_paths(existing_targets)
+        if not deduped_targets:
+            return "No matching targets to open."
+
+        max_to_open = 20
+        selected_targets = deduped_targets[:max_to_open]
+        failures: List[str] = []
+        opened: List[Path] = []
+
+        for target in selected_targets:
+            error = self._open_single_target(target, app)
+            if error:
+                failures.append(f"{target.name}: {error}")
+                continue
+            opened.append(target)
+
+        if opened:
+            self._remember_reference_paths(opened, mark_primary=True)
+
+        opened_names = ", ".join(p.name for p in opened[:20]) if opened else ""
+        truncated_note = ""
+        if len(deduped_targets) > max_to_open:
+            truncated_note = f" (opened first {max_to_open} of {len(deduped_targets)})"
+
+        if failures and not opened:
+            return f"Could not open any target: {'; '.join(failures[:3])}"
+        if failures:
+            return (
+                f"Opened {len(opened)} item(s){truncated_note}: {opened_names}. "
+                f"Failed {len(failures)} item(s)."
+            )
+        return f"Opened {len(opened)} item(s){truncated_note}: {opened_names}"
 
     def _handle_list(self, task: Dict[str, Any]) -> str:
         entities = task.get("entities", {})
@@ -331,23 +406,40 @@ class CliprExecutor:
 
         count = entities.get("count") or 1
         name = entities.get("name")
+        name_series = entities.get("name_series") or {}
         objects = entities.get("objects", [])
         extensions = entities.get("extensions", [])
+        bulk_names = self._build_series_names(name_series, count, name)
         created_paths: List[Path] = []
 
         if "folder" in objects:
-            folder_name = name or "New Folder"
-            target = self._unique_name(base_dir / folder_name)
-            target.mkdir(parents=True, exist_ok=False)
-            created_paths.append(target)
+            if bulk_names:
+                for folder_name in bulk_names:
+                    target = self._unique_name(base_dir / folder_name)
+                    target.mkdir(parents=True, exist_ok=False)
+                    created_paths.append(target)
+            else:
+                folder_name = name or "New Folder"
+                target = self._unique_name(base_dir / folder_name)
+                target.mkdir(parents=True, exist_ok=False)
+                created_paths.append(target)
         else:
             ext = extensions[0] if extensions else "txt"
-            stem = name or "new_file"
-            for i in range(count):
-                suffix = "" if count == 1 else f"_{i + 1}"
-                file_path = self._unique_name(base_dir / f"{stem}{suffix}.{ext}")
-                file_path.touch()
-                created_paths.append(file_path)
+            if bulk_names:
+                for stem in bulk_names:
+                    candidate_name = stem
+                    if Path(stem).suffix.lower().lstrip(".") != ext.lower():
+                        candidate_name = f"{stem}.{ext}"
+                    file_path = self._unique_name(base_dir / candidate_name)
+                    file_path.touch()
+                    created_paths.append(file_path)
+            else:
+                stem = name or "new_file"
+                for i in range(count):
+                    suffix = "" if count == 1 else f"_{i + 1}"
+                    file_path = self._unique_name(base_dir / f"{stem}{suffix}.{ext}")
+                    file_path.touch()
+                    created_paths.append(file_path)
 
         if not created_paths:
             return "No items were created."
@@ -359,6 +451,41 @@ class CliprExecutor:
         )
         names = ", ".join(p.name for p in created_paths)
         return f"Created {len(created_paths)} item(s): {names}"
+
+    def _build_series_names(
+        self,
+        name_series: Dict[str, Any],
+        fallback_count: int,
+        fallback_name: Optional[str],
+    ) -> List[str]:
+        if not name_series:
+            return []
+
+        prefix = (name_series.get("prefix") or fallback_name or "item").strip()
+        if not prefix:
+            return []
+
+        start = int(name_series.get("start", 1))
+        end = int(name_series.get("end", start))
+        separator = name_series.get("separator", " ")
+
+        step = 1 if end >= start else -1
+        numbers = list(range(start, end + step, step))
+
+        if fallback_count > 0 and len(numbers) != fallback_count:
+            if len(numbers) > fallback_count:
+                numbers = numbers[:fallback_count]
+            else:
+                while len(numbers) < fallback_count:
+                    numbers.append(numbers[-1] + step if numbers else start)
+
+        names: List[str] = []
+        for value in numbers:
+            if prefix.endswith((" ", "_", "-", ".")):
+                names.append(f"{prefix}{value}")
+            else:
+                names.append(f"{prefix}{separator}{value}")
+        return names
 
     def _handle_delete(self, task: Dict[str, Any]) -> str:
         entities = task.get("entities", {})
@@ -1042,8 +1169,9 @@ class CliprExecutor:
                 stem = source.stem
                 new_name = f"{stem}{rule.get('suffix', '')}{source.suffix}"
             else:
-                template = rule.get("template", "renamed")
-                new_name = f"{template}{idx}{source.suffix}"
+                template = (rule.get("template") or "renamed").strip()
+                separator = "" if template.endswith((" ", "_", "-", ".")) else " "
+                new_name = f"{template}{separator}{idx}{source.suffix}"
 
             target = source.with_name(new_name)
             resolved = self._resolve_conflict_target(target, conflict_policy)
@@ -1205,7 +1333,13 @@ class CliprExecutor:
 
     def _resolve_targets(self, task: Dict[str, Any], include_selection: bool = False) -> List[Path]:
         entities = task.get("entities", {})
+        filters = entities.get("filters", {})
+        time_constraints = entities.get("time_constraints", {})
         raw_clause = task.get("raw_clause", "")
+        base_search_dir = task_target_directory(task, self.context)
+        if not base_search_dir.exists() or not base_search_dir.is_dir():
+            base_search_dir = self.context.current_directory
+
         paths = [resolve_path_hint(raw, self.context) for raw in entities.get("paths", [])]
         existing_paths = [p for p in paths if p and p.exists()]
         if existing_paths:
@@ -1214,7 +1348,17 @@ class CliprExecutor:
         if include_selection and self.context.selected_paths and entities.get("context_refs", {}).get("uses_selection"):
             return [p for p in self.context.selected_paths if p.exists()]
 
-        if entities.get("context_refs", {}).get("uses_previous_context"):
+        if entities.get("context_refs", {}).get("uses_previous_context") and not any(
+            [
+                filters.get("contains_text"),
+                filters.get("regex_pattern"),
+                entities.get("extensions"),
+                filters.get("size_min_bytes") is not None,
+                filters.get("size_max_bytes") is not None,
+                bool(time_constraints) and any(v is not None for v in time_constraints.values()),
+            ]
+        ):
+
             if self.context.last_referenced_path and self.context.last_referenced_path.exists():
                 return [self.context.last_referenced_path]
             if self.context.last_referenced_paths:
@@ -1225,25 +1369,48 @@ class CliprExecutor:
                 return [self.context.last_opened_directory]
 
         name = entities.get("name")
-        if name:
-            candidate = self.context.current_directory / name
+        if name and not filters.get("all_items"):
+            candidate = base_search_dir / name
             if candidate.exists():
                 return [candidate]
             fuzzy = self._fuzzy_match_in_context(name, task)
             if fuzzy:
                 return [fuzzy]
 
-        # Handle explicit filename mentions like "delete test_1.py".
         filename_candidates = re.findall(r"\b[a-zA-Z0-9_-]+\.[a-zA-Z0-9]{1,8}\b", raw_clause)
         explicit_matches: List[Path] = []
         for filename in filename_candidates:
-            candidate = self.context.current_directory / filename.strip()
+            candidate = base_search_dir / filename.strip()
             if candidate.exists():
                 explicit_matches.append(candidate)
         if explicit_matches:
             return explicit_matches
 
-        # Handle simple natural commands like "zip demo" or "delete module1 permanently".
+        contains_text = filters.get("contains_text")
+        regex_pattern = filters.get("regex_pattern")
+        extensions = set(entities.get("extensions", []))
+        has_size_constraints = filters.get("size_min_bytes") is not None or filters.get("size_max_bytes") is not None
+        has_time_constraints = bool(time_constraints) and any(v is not None for v in time_constraints.values())
+        has_filter_query = any(
+            [
+                contains_text,
+                regex_pattern,
+                extensions,
+                has_size_constraints,
+                has_time_constraints,
+                filters.get("all_items"),
+            ]
+        )
+
+        if has_filter_query:
+            matches: List[Path] = []
+            for item in base_search_dir.iterdir():
+                if not self._matches_entity_filters(item, entities):
+                    continue
+                matches.append(item)
+            if matches:
+                return matches
+
         phrase_match = re.search(
             r"^(?:zip|extract|delete|open|list|show|find|locate|move|copy|cut|rename|properties)\s+(.+?)(?:\s+\b(?:in|to|from|with|by|inside|into|on|permanently|recursive|recursively)\b|$)",
             raw_clause.strip(),
@@ -1251,57 +1418,99 @@ class CliprExecutor:
         if phrase_match:
             phrase = phrase_match.group(1).strip()
             if phrase:
-                candidate = self.context.current_directory / phrase
+                candidate = base_search_dir / phrase
                 if candidate.exists():
                     return [candidate]
-                # Common case: user says extract demo (archive is demo.zip).
-                zip_candidate = self.context.current_directory / f"{phrase}.zip"
+                zip_candidate = base_search_dir / f"{phrase}.zip"
                 if zip_candidate.exists():
                     return [zip_candidate]
                 fuzzy = self._fuzzy_match_in_context(phrase, task)
                 if fuzzy:
                     return [fuzzy]
 
-        contains_text = entities.get("filters", {}).get("contains_text")
-        extensions = set(entities.get("extensions", []))
-        if contains_text or extensions:
-            matches: List[Path] = []
-            for item in self.context.current_directory.iterdir():
-                if contains_text and contains_text.lower() not in item.name.lower():
-                    continue
-                if extensions and item.is_file():
-                    if item.suffix.lower().lstrip(".") not in extensions:
-                        continue
-                matches.append(item)
-            return matches
-
         return []
 
     def _collect_items(self, base_dir: Path, entities: Dict[str, Any], recursive: bool) -> List[Path]:
-        objects = entities.get("objects", [])
-        want_folders = "folder" in objects
-        want_files = "file" in objects or not want_folders
-        ext_filter = set(entities.get("extensions", []))
-        contains_text = entities.get("filters", {}).get("contains_text")
-        time_constraints = entities.get("time_constraints", {})
-
         iterator = base_dir.rglob("*") if recursive else base_dir.glob("*")
         items: List[Path] = []
         for item in iterator:
-            if want_folders and not want_files and not item.is_dir():
-                continue
-            if want_files and not want_folders and item.is_dir():
-                continue
-            if ext_filter and item.is_file():
-                suffix = item.suffix.lower().lstrip(".")
-                if suffix not in ext_filter:
-                    continue
-            if contains_text and contains_text.lower() not in item.name.lower():
-                continue
-            if not self._matches_time_constraints(item, time_constraints):
+            if not self._matches_entity_filters(item, entities):
                 continue
             items.append(item)
         return items
+
+    def _matches_entity_filters(self, item: Path, entities: Dict[str, Any]) -> bool:
+        objects = entities.get("objects", [])
+        want_folders = "folder" in objects
+        want_files = "file" in objects or not want_folders
+
+        if want_folders and not want_files and not item.is_dir():
+            return False
+        if want_files and not want_folders and item.is_dir():
+            return False
+
+        ext_filter = set(entities.get("extensions", []))
+        if ext_filter:
+            if not item.is_file():
+                return False
+            suffix = item.suffix.lower().lstrip(".")
+            if suffix not in ext_filter:
+                return False
+
+        filters = entities.get("filters", {})
+        if not self._matches_name_filter(item, filters):
+            return False
+        if not self._matches_size_filter(item, filters):
+            return False
+
+        time_constraints = entities.get("time_constraints", {})
+        if not self._matches_time_constraints(item, time_constraints):
+            return False
+
+        return True
+
+    def _matches_name_filter(self, item: Path, filters: Dict[str, Any]) -> bool:
+        query = (filters.get("contains_text") or "").strip()
+        mode = (filters.get("name_match_mode") or "contains").lower()
+        regex_pattern = filters.get("regex_pattern")
+
+        if mode == "regex":
+            if not regex_pattern:
+                return True
+            try:
+                return bool(re.search(regex_pattern, item.name, flags=re.IGNORECASE))
+            except re.error:
+                return False
+
+        if not query:
+            return True
+
+        lowered_query = query.lower()
+        item_name = item.name.lower()
+        item_stem = item.stem.lower()
+
+        if mode == "exact":
+            return lowered_query in {item_name, item_stem}
+        if mode == "starts_with":
+            return item_name.startswith(lowered_query) or item_stem.startswith(lowered_query)
+        return lowered_query in item_name or lowered_query in item_stem
+
+    def _matches_size_filter(self, item: Path, filters: Dict[str, Any]) -> bool:
+        min_bytes = filters.get("size_min_bytes")
+        max_bytes = filters.get("size_max_bytes")
+
+        if min_bytes is None and max_bytes is None:
+            return True
+
+        if not item.is_file():
+            return False
+
+        size = item.stat().st_size
+        if min_bytes is not None and size < int(min_bytes):
+            return False
+        if max_bytes is not None and size > int(max_bytes):
+            return False
+        return True
 
     def _matches_time_constraints(self, item: Path, constraints: Dict[str, Any]) -> bool:
         if not constraints:
@@ -1366,6 +1575,19 @@ class CliprExecutor:
             return False
         if end and item_dt >= end:
             return False
+
+        older_than_days = constraints.get("older_than_days")
+        if older_than_days is not None:
+            cutoff = now - timedelta(days=float(older_than_days))
+            if item_dt > cutoff:
+                return False
+
+        newer_than_days = constraints.get("newer_than_days")
+        if newer_than_days is not None:
+            cutoff = now - timedelta(days=float(newer_than_days))
+            if item_dt < cutoff:
+                return False
+
         return True
 
     def _parse_date_expression(self, value: Optional[str]) -> Optional[datetime]:
@@ -1521,6 +1743,7 @@ class CliprExecutor:
         if best and best_score >= threshold:
             return best
         return None
+
 
 
 
