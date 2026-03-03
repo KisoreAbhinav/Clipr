@@ -83,7 +83,20 @@ APP_ALIASES: Dict[str, Set[str]] = {
     "chrome": {"chrome", "google chrome"},
     "edge": {"edge", "microsoft edge"},
     "vlc": {"vlc"},
+    "photos": {"photos", "photo viewer", "windows photos"},
+    "paintdotnet": {"paint.net", "paint net", "paintdotnet"},
+    "app_picker": {"app picker", "choose app", "choose application", "pick app", "open with options", "open with dialog"},
 }
+
+APP_ALIAS_LOOKUP: List[tuple[str, str]] = sorted(
+    [
+        (alias, app)
+        for app, aliases in APP_ALIASES.items()
+        for alias in aliases
+    ],
+    key=lambda item: len(item[0]),
+    reverse=True,
+)
 
 SORT_KEYWORDS: Set[str] = {"name", "date", "size", "type", "created", "modified"}
 
@@ -356,11 +369,18 @@ def get_main_tokens(tokens: List[str]) -> List[str]:
 
 def detect_intent(clause: str, main_tokens: List[str]) -> str:
     token_set = set(main_tokens)
+    open_lead_pattern = r"^(?:open|go|browse|visit|enter|navigate|head|launch|start)\b"
 
     # Phrase-first routing for conversational commands.
     if re.search(r"\b(?:go|navigate|enter|visit|head|open)\b(?:\s+to|\s+into)?\s+(?:thisfolder|currentfolder|thisdirectory|currentdirectory|desktop|downloads?|documents?|pictures?|photos?|music|videos?|home|parent)\b", clause):
         return "open"
     if re.search(r"\b(?:go up|up one level|parent folder|parent directory)\b", clause):
+        return "open"
+    if re.search(open_lead_pattern, clause):
+        # Keep metadata requests available for commands like
+        # "open properties of <file>" while allowing folder/file names such as "properties".
+        if re.search(r"\b(?:properties|details|metadata|information|info)\b\s+(?:of|for)\b", clause):
+            return "properties"
         return "open"
     if re.search(r"\b(?:what(?:'s| is)\s+(?:in|on)|(?:what|which)\s+(?:all\s+)?(?:files|folders|items)\s+(?:are\s+)?(?:in|on)|(?:what|which)\s+are\s+(?:the\s+)?(?:files|folders|items)\s+(?:in|on)|show me (?:what(?:'s| is)\s+(?:in|on)|contents|the contents|files|folders|items)|list out|show files|show folders|give me files|give me folders)\b", clause):
         return "list"
@@ -764,13 +784,58 @@ def extract_context_references(clause: str, main_tokens: List[str]) -> Dict[str,
     return refs
 
 
-def extract_open_with_app(clause: str) -> Optional[str]:
-    if "openwith" not in clause and "with " not in clause:
-        return None
-    for app, aliases in APP_ALIASES.items():
-        for alias in aliases:
-            if alias in clause:
-                return app
+def extract_open_with_app(clause: str, intent: Optional[str] = None) -> Optional[str]:
+    text = re.sub(r"\s+", " ", clause.lower()).strip()
+
+    # Explicit chooser requests.
+    app_picker_markers = {
+        "choose app",
+        "choose application",
+        "choose program",
+        "pick app",
+        "pick application",
+        "pick program",
+        "app picker",
+        "open with options",
+        "open with dialog",
+        "openwith options",
+        "openwith dialog",
+        "which app",
+        "which application",
+        "select app",
+        "let me choose app",
+        "ask me which app",
+    }
+    if any(marker in text for marker in app_picker_markers):
+        return "app_picker"
+
+    connectors = r"(?:with|using|by using|use|via|through|by|in|on)"
+    app_suffix = r"(?:\s+(?:app|application|program|software|editor|viewer|player))?"
+
+    # App mentions paired with natural language "open with app" phrasing.
+    for alias, app in APP_ALIAS_LOOKUP:
+        escaped = re.escape(alias)
+        if re.search(
+            rf"\b{connectors}\s+(?:the\s+)?{escaped}\b{app_suffix}",
+            text,
+        ):
+            return app
+        if re.search(
+            rf"\b(?:use|using)\s+(?:the\s+)?{escaped}\b{app_suffix}\s+(?:to\s+)?(?:open|launch|start)\b",
+            text,
+        ):
+            return app
+        if re.search(
+            rf"\b(?:open|launch|start)\b.*?\b{connectors}\s+(?:the\s+)?{escaped}\b{app_suffix}",
+            text,
+        ):
+            return app
+        if re.search(
+            rf"\bopenwith\s+(?:the\s+)?{escaped}\b{app_suffix}",
+            text,
+        ):
+            return app
+
     return None
 
 
@@ -1049,7 +1114,7 @@ def parse_task_clause(clause: str) -> Dict[str, Any]:
         "filters": extract_filters(clause, main_tokens, extensions),
         "delete_mode": extract_delete_mode(clause) if intent == "delete" else None,
         "conflict_policy": extract_conflict_policy(clause),
-        "open_with_app": extract_open_with_app(clause),
+        "open_with_app": extract_open_with_app(clause, intent),
         "time_constraints": extract_time_constraints(clause),
         "context_refs": extract_context_references(clause, main_tokens),
         "rename_rule": extract_rename_rule(clause) if intent == "rename" else None,

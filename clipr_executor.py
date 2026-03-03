@@ -3,10 +3,12 @@ import re
 import shutil
 import subprocess
 import uuid
+import mimetypes
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 import zipfile
 
 try:
@@ -198,6 +200,17 @@ class CliprExecutor:
             self._remember_reference_paths([resolved_target], mark_primary=True)
             return f"Opened directory: {resolved_target}"
 
+        if app == "app_picker":
+            app = self._prompt_app_choice(target)
+            if not app:
+                return "Open cancelled."
+            if app == "app_picker_dialog":
+                open_error = self._open_with_dialog(target)
+                if open_error:
+                    return f"Could not open target: {open_error}"
+                self._remember_reference_paths([target], mark_primary=True)
+                return f"Opened app chooser for: {target}"
+
         open_error = self._open_single_target(target, app)
         if open_error:
             return f"Could not open target: {open_error}"
@@ -208,6 +221,18 @@ class CliprExecutor:
         return f"Opened: {target}"
 
     def _open_single_target(self, target: Path, app: Optional[str]) -> Optional[str]:
+        if app:
+            if app == "default":
+                app = None
+            elif app == "photos":
+                return self._open_with_photos(target)
+            elif app == "paintdotnet":
+                return self._open_with_paintdotnet(target)
+            elif app == "chrome":
+                return self._open_with_chrome(target)
+            elif app == "edge":
+                return self._open_with_edge(target)
+
         if app:
             app_cmd = {
                 "vscode": "code",
@@ -223,15 +248,182 @@ class CliprExecutor:
             try:
                 subprocess.Popen([app_cmd, str(target)])
                 return None
-            except Exception:
-                # Fall back to default app if specific app launch fails.
-                pass
+            except Exception as exc:
+                return str(exc)
 
         try:
             os.startfile(str(target))
             return None
         except Exception as exc:
             return str(exc)
+
+    def _open_with_photos(self, target: Path) -> Optional[str]:
+        uri = f"ms-photos:viewer?fileName={quote(str(target))}"
+        try:
+            subprocess.Popen(["explorer.exe", uri])
+            return None
+        except Exception:
+            try:
+                os.startfile(str(target))
+                return None
+            except Exception as exc:
+                return str(exc)
+
+    def _open_with_paintdotnet(self, target: Path) -> Optional[str]:
+        attempts: List[List[str]] = [
+            ["paintdotnet", str(target)],
+            ["PaintDotNet", str(target)],
+            [r"C:\Program Files\paint.net\paintdotnet.exe", str(target)],
+            [r"C:\Program Files\paint.net\PaintDotNet.exe", str(target)],
+        ]
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            attempts.append([str(Path(local_appdata) / "paint.net" / "PaintDotNet.exe"), str(target)])
+
+        launch_error = self._launch_with_candidates(attempts)
+        if launch_error:
+            return "paint.net executable not found."
+        return None
+
+    def _open_with_chrome(self, target: Path) -> Optional[str]:
+        attempts: List[List[str]] = [
+            ["chrome", str(target)],
+            [r"C:\Program Files\Google\Chrome\Application\chrome.exe", str(target)],
+            [r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", str(target)],
+        ]
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            attempts.append([str(Path(local_appdata) / "Google" / "Chrome" / "Application" / "chrome.exe"), str(target)])
+
+        launch_error = self._launch_with_candidates(attempts)
+        if launch_error:
+            return "Google Chrome executable not found."
+        return None
+
+    def _open_with_edge(self, target: Path) -> Optional[str]:
+        attempts: List[List[str]] = [
+            ["msedge", str(target)],
+            [r"C:\Program Files\Microsoft\Edge\Application\msedge.exe", str(target)],
+            [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", str(target)],
+        ]
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            attempts.append([str(Path(local_appdata) / "Microsoft" / "Edge" / "Application" / "msedge.exe"), str(target)])
+
+        launch_error = self._launch_with_candidates(attempts)
+        if launch_error:
+            return "Microsoft Edge executable not found."
+        return None
+
+    def _launch_with_candidates(self, attempts: List[List[str]]) -> Optional[str]:
+        last_error: Optional[str] = None
+        for cmd in attempts:
+            executable = cmd[0]
+            if (":" in executable or executable.startswith("\\")) and not Path(executable).exists():
+                continue
+            try:
+                subprocess.Popen(cmd)
+                return None
+            except Exception as exc:
+                last_error = str(exc)
+        return last_error or "No launch candidate succeeded."
+
+    def _open_with_dialog(self, target: Path) -> Optional[str]:
+        try:
+            subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL", str(target)])
+            return None
+        except Exception as exc:
+            return str(exc)
+
+    def _prompt_app_choice(self, target: Path) -> Optional[str]:
+        options = ["default"] + self._candidate_apps_for_file(target) + ["app_picker_dialog"]
+
+        deduped: List[str] = []
+        for option in options:
+            if option not in deduped:
+                deduped.append(option)
+        options = deduped
+
+        labels = {
+            "default": "Default app",
+            "photos": "Photos",
+            "paintdotnet": "Paint.NET",
+            "notepad": "Notepad",
+            "vscode": "VS Code",
+            "acrobat": "Adobe Acrobat Reader",
+            "edge": "Microsoft Edge",
+            "chrome": "Google Chrome",
+            "vlc": "VLC",
+            "word": "Microsoft Word",
+            "excel": "Microsoft Excel",
+            "powerpoint": "Microsoft PowerPoint",
+            "app_picker_dialog": "System Open With dialog",
+        }
+
+        print(f"Choose app for '{target.name}':")
+        for idx, option in enumerate(options, start=1):
+            print(f"{idx}. {labels.get(option, option)}")
+
+        raw = input("App number or name (blank to cancel): ").strip().lower()
+        if not raw:
+            return None
+        if raw.isdigit():
+            index = int(raw) - 1
+            if 0 <= index < len(options):
+                return options[index]
+            return None
+
+        normalized = raw.replace(" ", "")
+        alias_map = {
+            "default": "default",
+            "systemdefault": "default",
+            "photos": "photos",
+            "paint.net": "paintdotnet",
+            "paintnet": "paintdotnet",
+            "paintdotnet": "paintdotnet",
+            "notepad": "notepad",
+            "vscode": "vscode",
+            "code": "vscode",
+            "acrobat": "acrobat",
+            "edge": "edge",
+            "chrome": "chrome",
+            "vlc": "vlc",
+            "word": "word",
+            "excel": "excel",
+            "powerpoint": "powerpoint",
+            "dialog": "app_picker_dialog",
+            "openwith": "app_picker_dialog",
+            "openwithdialog": "app_picker_dialog",
+        }
+        selected = alias_map.get(normalized)
+        if selected in options:
+            return selected
+        return None
+
+    def _candidate_apps_for_file(self, target: Path) -> List[str]:
+        suffix = target.suffix.lower()
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+        text_exts = {".txt", ".md", ".py", ".json", ".xml", ".yaml", ".yml", ".log", ".csv"}
+        doc_exts = {".doc", ".docx"}
+        sheet_exts = {".xls", ".xlsx"}
+        slide_exts = {".ppt", ".pptx"}
+        media_exts = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".mp4", ".mkv", ".avi", ".mov", ".wmv"}
+
+        if suffix in image_exts:
+            return ["photos", "paintdotnet", "edge"]
+        if suffix == ".pdf":
+            return ["acrobat", "edge", "chrome"]
+        if suffix in text_exts:
+            return ["notepad", "vscode"]
+        if suffix in doc_exts:
+            return ["word"]
+        if suffix in sheet_exts:
+            return ["excel"]
+        if suffix in slide_exts:
+            return ["powerpoint"]
+        if suffix in media_exts:
+            return ["vlc", "edge"]
+        return ["edge", "notepad"]
 
     def _open_multiple_targets(self, targets: List[Path], app: Optional[str]) -> str:
         existing_targets = [p for p in targets if p and p.exists()]
@@ -715,6 +907,17 @@ class CliprExecutor:
         conflict_policy = entities.get("conflict_policy", "ask")
 
         sources = self._resolve_targets(task, include_selection=True)
+        indexed_pdf_ref = self._extract_pdf_reference_index(task.get("raw_clause", ""), action)
+        if not sources and indexed_pdf_ref is not None:
+            candidates = sorted(
+                [p for p in self.context.current_directory.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"],
+                key=lambda p: p.name.lower(),
+            )
+            if not candidates:
+                return "No PDF files found in current directory."
+            if indexed_pdf_ref < 1 or indexed_pdf_ref > len(candidates):
+                return f"PDF index {indexed_pdf_ref} is out of range. Available PDFs: 1 to {len(candidates)}."
+            sources = [candidates[indexed_pdf_ref - 1]]
         if not sources:
             sources = [p for p in self.context.current_directory.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
 
@@ -761,6 +964,59 @@ class CliprExecutor:
             pdf_info.get("rotation_degrees"),
             conflict_policy,
         )
+
+    def _extract_pdf_reference_index(self, raw_clause: str, action: str) -> Optional[int]:
+        # Avoid accidental interpretation of rotation degrees like "rotate pdf 90".
+        if action not in {"compress", "split", "properties"}:
+            return None
+
+        text = (raw_clause or "").lower().strip()
+        if not text:
+            return None
+
+        patterns = [
+            r"\b(?:compresspdf|optimizepdf)\s+(\d+)\b",
+            r"\bpdf(?:\s+number)?\s+(\d+)\b",
+            r"\b(\d+)(?:st|nd|rd|th)\s+pdf\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    pass
+
+        ordinal_map = {
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+            "sixth": 6,
+            "seventh": 7,
+            "eighth": 8,
+            "ninth": 9,
+            "tenth": 10,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+        for word, value in ordinal_map.items():
+            if re.search(rf"\b(?:compresspdf|optimizepdf)\s+{word}\b", text):
+                return value
+            if re.search(rf"\bpdf\s+{word}\b", text):
+                return value
+            if re.search(rf"\b{word}\s+pdf\b", text):
+                return value
+        return None
 
     def _preview_pdf_conflicts(
         self,
@@ -1191,17 +1447,182 @@ class CliprExecutor:
         return f"Renamed {len(rename_pairs)} item(s)."
 
     def _handle_properties(self, task: Dict[str, Any]) -> str:
+        raw_clause = task.get("raw_clause", "")
         targets = self._resolve_targets(task, include_selection=True)
         if not targets:
             return "No target found for properties."
+
+        if len(targets) > 1:
+            indexed_pdf_ref = self._extract_pdf_reference_index(raw_clause, "properties")
+            if indexed_pdf_ref is not None:
+                sorted_targets = sorted(targets, key=lambda p: p.name.lower())
+                if indexed_pdf_ref < 1 or indexed_pdf_ref > len(sorted_targets):
+                    return f"PDF index {indexed_pdf_ref} is out of range. Available PDFs: 1 to {len(sorted_targets)}."
+                targets = [sorted_targets[indexed_pdf_ref - 1]]
+            else:
+                preview = ", ".join(p.name for p in sorted(targets, key=lambda p: p.name.lower())[:8])
+                more = "" if len(targets) <= 8 else f" ... (+{len(targets) - 8} more)"
+                return (
+                    "Multiple items matched. Say the exact file name (for example: "
+                    "properties of report.pdf) or use an index (for example: properties of pdf 2). "
+                    f"Matches: {preview}{more}"
+                )
+
         path = targets[0]
         if not path.exists():
             return f"Path does not exist: {path}"
+        lines = self._build_properties_lines(path)
+        return "\n".join(lines)
+
+    def _build_properties_lines(self, path: Path) -> List[str]:
         stat = path.stat()
-        return (
-            f"Properties for {path.name}: size={stat.st_size} bytes, "
-            f"modified={stat.st_mtime}, is_dir={path.is_dir()}"
-        )
+        windows_attrs = self._get_windows_attributes(path)
+        attr_flags = [name for name, enabled in windows_attrs.items() if enabled]
+
+        details: List[str] = [
+            f"Properties for {path.name}",
+            f"Path: {path.resolve()}",
+            f"Parent: {path.parent.resolve()}",
+            f"Type: {self._friendly_type_name(path)}",
+            f"Extension: {path.suffix.lower() if path.suffix else '(none)'}",
+            f"Exists: {path.exists()}",
+            f"Is file: {path.is_file()}",
+            f"Is directory: {path.is_dir()}",
+            f"Is symlink: {path.is_symlink()}",
+            f"Created: {self._format_timestamp(stat.st_ctime)}",
+            f"Modified: {self._format_timestamp(stat.st_mtime)}",
+            f"Accessed: {self._format_timestamp(stat.st_atime)}",
+        ]
+
+        if path.is_file():
+            mime_type, encoding = mimetypes.guess_type(path.name)
+            details.append(f"Size: {stat.st_size} bytes ({self._human_size(stat.st_size)})")
+            details.append(f"MIME type: {mime_type or 'unknown'}")
+            details.append(f"Encoding hint: {encoding or 'none'}")
+
+            if path.suffix.lower() == ".pdf":
+                if PdfReader is not None:
+                    try:
+                        reader = PdfReader(str(path))
+                        details.append(f"PDF pages: {len(reader.pages)}")
+                        details.append(f"PDF encrypted: {bool(getattr(reader, 'is_encrypted', False))}")
+                    except Exception as exc:
+                        details.append(f"PDF metadata read: unavailable ({exc})")
+                else:
+                    details.append("PDF metadata read: unavailable (pypdf not installed)")
+        else:
+            folder_size, file_count, dir_count, skipped = self._folder_metrics(path)
+            details.append(f"Folder size (recursive): {folder_size} bytes ({self._human_size(folder_size)})")
+            details.append(f"Files inside (recursive): {file_count}")
+            details.append(f"Subfolders inside (recursive): {dir_count}")
+            if skipped:
+                details.append(f"Skipped entries (permissions/errors): {skipped}")
+
+        is_hidden = path.name.startswith(".") or windows_attrs.get("hidden", False)
+        is_read_only = windows_attrs.get("read_only", False) or (not os.access(path, os.W_OK))
+        details.append(f"Hidden: {is_hidden}")
+        details.append(f"Read-only: {is_read_only}")
+        details.append(f"Windows attributes: {', '.join(attr_flags) if attr_flags else '(none)'}")
+        return details
+
+    def _human_size(self, size_bytes: int) -> str:
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        units = ["KB", "MB", "GB", "TB", "PB"]
+        value = float(size_bytes)
+        unit = units[0]
+        for unit in units:
+            value /= 1024.0
+            if value < 1024.0:
+                break
+        return f"{value:.2f} {unit}"
+
+    def _format_timestamp(self, unix_ts: float) -> str:
+        try:
+            return datetime.fromtimestamp(unix_ts).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(unix_ts)
+
+    def _friendly_type_name(self, path: Path) -> str:
+        if path.is_dir():
+            return "File folder"
+
+        suffix = path.suffix.lower()
+        friendly_map = {
+            ".pdf": "PDF Document",
+            ".txt": "Text Document",
+            ".md": "Markdown Document",
+            ".doc": "Microsoft Word Document",
+            ".docx": "Microsoft Word Document",
+            ".xls": "Microsoft Excel Worksheet",
+            ".xlsx": "Microsoft Excel Worksheet",
+            ".ppt": "Microsoft PowerPoint Presentation",
+            ".pptx": "Microsoft PowerPoint Presentation",
+            ".png": "PNG Image",
+            ".jpg": "JPEG Image",
+            ".jpeg": "JPEG Image",
+            ".gif": "GIF Image",
+            ".bmp": "Bitmap Image",
+            ".webp": "WEBP Image",
+            ".zip": "ZIP Archive",
+            ".py": "Python Source File",
+            ".json": "JSON File",
+            ".xml": "XML File",
+            ".csv": "CSV File",
+            ".mp3": "MP3 Audio",
+            ".wav": "WAV Audio",
+            ".mp4": "MP4 Video",
+        }
+        if suffix in friendly_map:
+            return friendly_map[suffix]
+        if suffix:
+            return f"{suffix.upper().lstrip('.')} File"
+        return "File"
+
+    def _folder_metrics(self, root: Path) -> Tuple[int, int, int, int]:
+        total_size = 0
+        file_count = 0
+        dir_count = 0
+        skipped = 0
+
+        for current_root, dirs, files in os.walk(root, onerror=lambda _: None):
+            dir_count += len(dirs)
+            for file_name in files:
+                file_path = Path(current_root) / file_name
+                try:
+                    total_size += file_path.stat().st_size
+                    file_count += 1
+                except Exception:
+                    skipped += 1
+
+        return total_size, file_count, dir_count, skipped
+
+    def _get_windows_attributes(self, path: Path) -> Dict[str, bool]:
+        if os.name != "nt":
+            return {}
+        try:
+            import ctypes
+
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+            if attrs == 0xFFFFFFFF:
+                return {}
+
+            return {
+                "read_only": bool(attrs & 0x1),
+                "hidden": bool(attrs & 0x2),
+                "system": bool(attrs & 0x4),
+                "archive": bool(attrs & 0x20),
+                "normal": bool(attrs & 0x80),
+                "temporary": bool(attrs & 0x100),
+                "sparse_file": bool(attrs & 0x200),
+                "reparse_point": bool(attrs & 0x400),
+                "compressed": bool(attrs & 0x800),
+                "offline": bool(attrs & 0x1000),
+                "not_content_indexed": bool(attrs & 0x2000),
+                "encrypted": bool(attrs & 0x4000),
+            }
+        except Exception:
+            return {}
 
     def _handle_undo(self, _: Dict[str, Any]) -> str:
         if not self.context.undo_stack:
@@ -1683,9 +2104,15 @@ class CliprExecutor:
         if len(normalized_query) < 2:
             return None
 
+        intent = task.get("intent")
         entities = task.get("entities", {})
         want_folders = "folder" in entities.get("objects", [])
         want_files = "file" in entities.get("objects", []) or not want_folders
+        if intent == "open":
+            # Open should be permissive: users often say natural labels that could
+            # refer to either folders or files.
+            want_folders = True
+            want_files = True
 
         candidates: List[Path] = []
         for item in self.context.current_directory.iterdir():
@@ -1713,8 +2140,9 @@ class CliprExecutor:
         best_score = 0.0
 
         for candidate in candidates:
-            candidate_norm = self._normalize_for_match(candidate.stem)
-            candidate_tokens = [tok for tok in re.findall(r"[a-z0-9]+", candidate.stem.lower()) if tok]
+            candidate_label = candidate.name if candidate.is_dir() else candidate.stem
+            candidate_norm = self._normalize_for_match(candidate_label)
+            candidate_tokens = [tok for tok in re.findall(r"[a-z0-9]+", candidate_label.lower()) if tok]
 
             if normalized_query == candidate_norm:
                 score = 1.0
@@ -1738,7 +2166,6 @@ class CliprExecutor:
                 best_score = score
                 best = candidate
 
-        intent = task.get("intent")
         threshold = 0.6 if intent == "open" else 0.72
         if best and best_score >= threshold:
             return best
